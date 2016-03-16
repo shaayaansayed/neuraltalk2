@@ -1,4 +1,3 @@
-
 require 'torch'
 require 'nn'
 require 'nngraph'
@@ -21,10 +20,10 @@ cmd:text()
 cmd:text('Options')
 
 -- Data input settings
-cmd:option('-input_h5','coco/data.h5','path to the h5file containing the preprocessed dataset')
-cmd:option('-input_json','coco/data.json','path to the json file containing additional info and vocab')
-cmd:option('-cnn_proto','model/VGG_ILSVRC_16_layers_deploy.prototxt','path to CNN prototxt file in Caffe format. Note this MUST be a VGGNet-16 right now.')
-cmd:option('-cnn_model','model/VGG_ILSVRC_16_layers.caffemodel','path to CNN model file containing the weights, Caffe format. Note this MUST be a VGGNet-16 right now.')
+cmd:option('-input_h5','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.h5','path to the h5file containing the preprocessed dataset')
+cmd:option('-input_json','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.json','path to the json file containing additional info and vocab')
+cmd:option('-cnn_proto','/scratch/cluster/vsub/ssayed/cnn_proto/VGG_ILSVRC_16_layers_deploy.prototxt','path to CNN prototxt file in Caffe format. Note this MUST be a VGGNet-16 right now.')
+cmd:option('-cnn_model','/scratch/cluster/vsub/ssayed/cnn_proto/VGG_ILSVRC_16_layers.caffemodel','path to CNN model file containing the weights, Caffe format. Note this MUST be a VGGNet-16 right now.')
 cmd:option('-start_from', '', 'path to a model checkpoint to initialize model weights from. Empty = don\'t')
 
 -- Model settings
@@ -56,8 +55,8 @@ cmd:option('-cnn_weight_decay', 0, 'L2 weight decay just for the CNN')
 -- Evaluation/Checkpointing
 cmd:option('-val_images_use', 3200, 'how many images to use when periodically evaluating the validation loss? (-1 = all)')
 cmd:option('-save_checkpoint_every', 2500, 'how often to save a model checkpoint?')
-cmd:option('-checkpoint_path', '', 'folder to save checkpoints into (empty = this folder)')
-cmd:option('-language_eval', 0, 'Evaluate language as well (1 = yes, 0 = no)? BLEU/CIDEr/METEOR/ROUGE_L? requires coco-caption code from Github.')
+cmd:option('-checkpoint_path', '/scratch/cluster/vsub/ssayed/models/nt2Spring2016', 'folder to save checkpoints into (empty = this folder)')
+cmd:option('-language_eval', 1, 'Evaluate language as well (1 = yes, 0 = no)? BLEU/CIDEr/METEOR/ROUGE_L? requires coco-caption code from Github.')
 cmd:option('-losses_log_every', 25, 'How often do we snapshot losses, for inclusion in the progress dump? (0 = disable)')
 
 -- misc

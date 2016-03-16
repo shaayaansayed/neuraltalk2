@@ -80,13 +80,13 @@ function DataLoader:getBatch(opt)
   local batch_size = utils.getopt(opt, 'batch_size', 5) -- how many images get returned at one time (to go through CNN)
   local seq_per_img = utils.getopt(opt, 'seq_per_img', 5) -- number of sequences to return per image
 
-  local split_ix = self.split_ix[split]
+  local split_ix = self.split_ix[split] -- table of image ids in split 
   assert(split_ix, 'split ' .. split .. ' not found.')
 
   -- pick an index of the datapoint to load next
   local img_batch_raw = torch.ByteTensor(batch_size, 3, 256, 256)
   local label_batch = torch.LongTensor(batch_size * seq_per_img, self.seq_length)
-  local max_index = #split_ix
+  local max_index = #split_ix -- number of images in split
   local wrapped = false
   local infos = {}
   for i=1,batch_size do
