@@ -25,7 +25,7 @@ cmd:option('-input_json','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.json','pa
 cmd:option('-cnn_proto','/scratch/cluster/vsub/ssayed/cnn_proto/VGG_ILSVRC_16_layers_deploy.prototxt','path to CNN prototxt file in Caffe format. Note this MUST be a VGGNet-16 right now.')
 cmd:option('-cnn_model','/scratch/cluster/vsub/ssayed/cnn_proto/VGG_ILSVRC_16_layers.caffemodel','path to CNN model file containing the weights, Caffe format. Note this MUST be a VGGNet-16 right now.')
 cmd:option('-start_from', '', 'path to a model checkpoint to initialize model weights from. Empty = don\'t')
-cmd:option('-feats_dir', '/scratch/cluster/vsub/ssayed/MSCOCO/feats_nt2', 'directory with train/val convnet feat t7 files')
+cmd:option('-feats_dir', '/scratch/cluster/vsub/ssayed/MSCOCO/feats_nt_avg', 'directory with train/val convnet feat t7 files')
 
 -- Model settings
 cmd:option('-rnn_size',512,'size of the rnn in number of hidden nodes in each layer')
@@ -168,6 +168,8 @@ local function eval_split(split, evalopt)
 
     -- fetch a batch of data
     local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
+    data.feats = data.feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
+    data.feats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
     data.feats = data.feats:cuda()
     n = n + data.feats:size(1)
 
@@ -224,8 +226,9 @@ local function lossFun()
   -----------------------------------------------------------------------------
   -- get batch of data  
   local data = loader:getBatch{batch_size = opt.batch_size, split = 'train', seq_per_img = opt.seq_per_img}
+  data.feats = data.feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
+  data.feats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
   data.feats = data.feats:cuda()
-
   -- we have to expand out image features, once for each sentence
   local expanded_feats = protos.expander:forward(data.feats)
   -- forward the language model
