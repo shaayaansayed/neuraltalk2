@@ -2,12 +2,13 @@ require 'nn'
 require 'nngraph'
 
 local LSTM = {}
-function LSTM.lstm(input_size, output_size, rnn_size, n, dropout)
+function LSTM.lstm(input_size, output_size, context_size, rnn_size, n, dropout)
   dropout = dropout or 0 
 
   -- there will be 2*n+1 inputs
   local inputs = {}
   table.insert(inputs, nn.Identity()()) -- indices giving the sequence of symbols
+  table.insert(inputs, nn.Identity()()) -- context
   for L = 1,n do
     table.insert(inputs, nn.Identity()()) -- prev_c[L]
     table.insert(inputs, nn.Identity()()) -- prev_h[L]
@@ -17,8 +18,8 @@ function LSTM.lstm(input_size, output_size, rnn_size, n, dropout)
   local outputs = {}
   for L = 1,n do
     -- c,h from previos timesteps
-    local prev_h = inputs[L*2+1]
-    local prev_c = inputs[L*2]
+    local prev_h = inputs[L*2+2]
+    local prev_c = inputs[L*2+1]
     -- the input to this layer
     if L == 1 then 
       x = inputs[1]
@@ -31,7 +32,8 @@ function LSTM.lstm(input_size, output_size, rnn_size, n, dropout)
     -- evaluate the input sums at once for efficiency
     local i2h = nn.Linear(input_size_L, 4 * rnn_size)(x):annotate{name='i2h_'..L}
     local h2h = nn.Linear(rnn_size, 4 * rnn_size)(prev_h):annotate{name='h2h_'..L}
-    local all_input_sums = nn.CAddTable()({i2h, h2h})
+    local c2h = nn.Linear(context_size, 4 * rnn_size)(inputs[2]):annotate{name='h2h_'..L}
+    local all_input_sums = nn.CAddTable()({i2h, h2h, c2h})
 
     local reshaped = nn.Reshape(4, rnn_size)(all_input_sums)
     local n1, n2, n3, n4 = nn.SplitTable(2)(reshaped):split(4)
