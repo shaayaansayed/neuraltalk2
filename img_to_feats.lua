@@ -19,7 +19,7 @@ cmd:option('-input_h5','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.h5','path t
 cmd:option('-input_json','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.json','path to the json file containing additional info and vocab')
 cmd:option('-cnn_proto','/scratch/cluster/vsub/ssayed/cnn_proto/VGG_ILSVRC_16_layers_deploy.prototxt','path to CNN prototxt file in Caffe format. Note this MUST be a VGGNet-16 right now.')
 cmd:option('-cnn_model','/scratch/cluster/vsub/ssayed/cnn_proto/VGG_ILSVRC_16_layers.caffemodel','path to CNN model file containing the weights, Caffe format. Note this MUST be a VGGNet-16 right now.')
-cmd:option('-feats_dir','/scratch/cluster/vsub/ssayed/MSCOCO/feats_nt2','where to save feat t7 files')
+cmd:option('-feats_dir','/scratch/cluster/vsub/ssayed/MSCOCO/feats_nt_avg','where to save feat t7 files')
 
 -- misc
 cmd:option('-batch_size',16,'what is the batch size in number of images per batch? (there will be x seq_per_img sentences)')
