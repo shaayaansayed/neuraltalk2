@@ -1,7 +1,9 @@
 require 'nn'
+require 'cutorch'
 local utils = require 'misc.utils'
 local net_utils = require 'misc.net_utils'
 local LSTM = require 'misc.LSTM'
+local Attention = require 'misc.Attention'
 
 -------------------------------------------------------------------------------
 -- Language Model core
@@ -22,6 +24,7 @@ function layer:__init(opt)
   -- create the core lstm network. note +1 for both the START and END tokens
   self.core = LSTM.lstm(self.input_encoding_size, self.vocab_size + 1, 512, self.rnn_size, self.num_layers, dropout)
   self.lookup_table = nn.LookupTable(self.vocab_size + 1, self.input_encoding_size)
+  self.att = Attention.att(16, 5, 196, 512, 512, self.rnn_size, dropout)
   self:_createInitState(1) -- will be lazily resized later during forward passes
 end
 
@@ -47,28 +50,33 @@ function layer:createClones()
   print('constructing clones inside the LanguageModel')
   self.clones = {self.core}
   self.lookup_tables = {self.lookup_table}
-  for t=2,self.seq_length+2 do
+  self.att_clones = {self.att}
+  for t=2,self.seq_length+1 do
     self.clones[t] = self.core:clone('weight', 'bias', 'gradWeight', 'gradBias')
     self.lookup_tables[t] = self.lookup_table:clone('weight', 'gradWeight')
+    self.att_clones[t] = self.att:clone('weight', 'bias', 'gradWeight', 'gradBias')
   end
 end
 
 function layer:getModulesList()
-  return {self.core, self.lookup_table}
+  return {self.core, self.lookup_table, self.att}
 end
 
 function layer:parameters()
   -- we only have two internal modules, return their params
   local p1,g1 = self.core:parameters()
   local p2,g2 = self.lookup_table:parameters()
+  local p3,g3 = self.att:parameters()
 
   local params = {}
   for k,v in pairs(p1) do table.insert(params, v) end
   for k,v in pairs(p2) do table.insert(params, v) end
-  
+  for k,v in pairs(p3) do table.insert(params, v) end
+
   local grad_params = {}
   for k,v in pairs(g1) do table.insert(grad_params, v) end
   for k,v in pairs(g2) do table.insert(grad_params, v) end
+  for k,v in pairs(g3) do table.insert(grad_params, v) end
 
   -- todo: invalidate self.clones if params were requested?
   -- what if someone outside of us decided to call getParameters() or something?
@@ -81,12 +89,14 @@ function layer:training()
   if self.clones == nil then self:createClones() end -- create these lazily if needed
   for k,v in pairs(self.clones) do v:training() end
   for k,v in pairs(self.lookup_tables) do v:training() end
+  for k,v in pairs(self.att_clones) do v:training() end
 end
 
 function layer:evaluate()
   if self.clones == nil then self:createClones() end -- create these lazily if needed
   for k,v in pairs(self.clones) do v:evaluate() end
   for k,v in pairs(self.lookup_tables) do v:evaluate() end
+  for k,v in pairs(self.att_clones) do v:evaluate() end
 end
 
 --[[
@@ -95,12 +105,12 @@ Careful: make sure model is in :evaluate() mode if you're calling this.
 Returns: a DxN LongTensor with integer elements 1..M, 
 where D is sequence length and N is batch (so columns are sequences)
 --]]
-function layer:sample(context, opt)
+function layer:sample(avg_context, feats, opt)
   local sample_max = utils.getopt(opt, 'sample_max', 1)
   local beam_size = utils.getopt(opt, 'beam_size', 1)
   local temperature = utils.getopt(opt, 'temperature', 1.0)
 
-  local batch_size = context:size(1)
+  local batch_size = avg_context:size(1)
   self:_createInitState(batch_size)
   local state = self.init_state
 
@@ -110,12 +120,15 @@ function layer:sample(context, opt)
   local logprobs -- logprobs predicted in last time step
   for t=1,self.seq_length+1 do
 
-    local xt, it, sampleLogprobs
+    local xt, it, context, sampleLogprobs
     if t == 1 then
+      context = avg_context
       -- feed in the start tokens
       it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
       xt = self.lookup_table:forward(it)
     else
+      context = self.att:forward{feats, state[self.num_state]}
+
       -- take predictions from previous time step and feed them in
       if sample_max == 1 then
         -- use argmax "sampling"
@@ -154,8 +167,7 @@ function layer:sample(context, opt)
 end
 
 function layer:updateOutput(input)
-  local context = input[1]
-  local seq = input[2]
+  local seq = input[3]
   if self.clones == nil then self:createClones() end -- lazily create clones on first forward pass
 
   assert(seq:size(1) == self.seq_length)
@@ -168,12 +180,15 @@ function layer:updateOutput(input)
   self.inputs = {}
   self.lookup_tables_inputs = {}
   self.tmax = 0 -- we will keep track of max sequence length encountered in the data for efficiency
+  self.att_inputs = {}
   for t=1,self.seq_length+1 do
 
     local can_skip = false
     local xt
+    local context
     if t == 1 then
       -- feed in the start tokens
+      context = input[1]
       local it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
       self.lookup_tables_inputs[t] = it
       xt = self.lookup_tables[t]:forward(it) -- NxK sized input (token embedding vectors)
@@ -190,12 +205,19 @@ function layer:updateOutput(input)
       if not can_skip then
         self.lookup_tables_inputs[t] = it
         xt = self.lookup_tables[t]:forward(it)
+
+        local feats = input[2]
+        self.att_inputs[t] = {feats,self.state[t-1][#self.state[t-1]]}
+        context = self.att_clones[t]:forward(self.att_inputs[t])
+
       end
     end
 
     if not can_skip then
       -- construct the inputs
       self.inputs[t] = {xt,context,unpack(self.state[t-1])}
+      -- print(xt:size())
+      -- print(context:size())
       -- forward the network
       local out = self.clones[t]:forward(self.inputs[t])
       -- process the outputs
@@ -226,15 +248,17 @@ function layer:updateGradInput(input, gradOutput)
     -- split the gradient to xt and to state
     local dxt = dinputs[1] -- first element is the input vector
     dstate[t-1] = {} -- copy over rest to state grad
-    for k=2,self.num_state+1 do table.insert(dstate[t-1], dinputs[k]) end
-    
-    -- continue backprop of xt
-    if t == 1 then
-      dimgs = dxt
-    else
-      local it = self.lookup_tables_inputs[t]
-      self.lookup_tables[t]:backward(it, dxt) -- backprop into lookup table
+    for k=3,self.num_state+2 do table.insert(dstate[t-1], dinputs[k]) end
+
+    if t ~= 1 then 
+      local dcontext = dinputs[2]
+      local datt = self.att_clones[t]:backward(self.att_inputs[t], dcontext)
+      dstate[t-1][self.num_state]:add(datt[2])
     end
+
+    local dxt = dinputs[2]
+    local it = self.lookup_tables_inputs[t]
+    self.lookup_tables[t]:backward(it, dxt) 
   end
 
   -- we have gradient on image, but for LongTensor gt sequence we only create an empty tensor - can't backprop

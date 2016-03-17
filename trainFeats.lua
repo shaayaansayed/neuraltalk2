@@ -29,7 +29,7 @@ cmd:option('-feats_dir', '/scratch/cluster/vsub/ssayed/MSCOCO/feats_nt_avg', 'di
 
 -- Model settings
 cmd:option('-rnn_size',512,'size of the rnn in number of hidden nodes in each layer')
-cmd:option('-input_encoding_size',4096,'the encoding size of each token in the vocabulary, and the image.')
+cmd:option('-input_encoding_size',512,'the encoding size of each token in the vocabulary, and the image.')
 
 -- Optimization: General
 cmd:option('-max_iters', -1, 'max number of iterations to run for (-1 = run forever)')
@@ -154,7 +154,7 @@ collectgarbage() -- "yeah, sure why not"
 -- Validation evaluation
 -------------------------------------------------------------------------------
 local function eval_split(split, evalopt)
-  local verbose = utils.getopt(evalopt, 'verbose', true)
+  local verbose = utils.getopt(evalopt, 'verbose', false)
   local val_images_use = utils.getopt(evalopt, 'val_images_use', true)
 
   protos.lm:evaluate()
@@ -169,19 +169,33 @@ local function eval_split(split, evalopt)
     -- fetch a batch of data
     local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
     data.feats = data.feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
-    data.feats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
     data.feats = data.feats:cuda()
+    local avgfeats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
     n = n + data.feats:size(1)
+    data.labels = data.labels:cuda()
 
-    local expanded_feats = protos.expander:forward(data.feats)
-    local logprobs = protos.lm:forward{expanded_feats, data.labels}
+    -- local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
+    -- local feats = data.feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
+    -- local avgfeats = torch.sum(torch.div(feats, 196), 2):select(2,1) -- 16x512
+    -- n = n + data.feats:size(1)
+
+    -- feats = feats:cuda()
+    -- avgfeats = avgfeats:cuda()
+
+    local expanded_feats = protos.expander:forward(avgfeats)
+    local logprobs = protos.lm:forward{expanded_feats, data.feats, data.labels}
     local loss = protos.crit:forward(logprobs, data.labels)
     loss_sum = loss_sum + loss
     loss_evals = loss_evals + 1
 
     -- forward the model to also get generated samples for each image
-    local seq = protos.lm:sample(data.feats)
-    local sents = net_utils.decode_sequence(vocab, seq)
+    local seq = protos.lm:sample(expanded_feats, data.feats)
+    local all_sents = net_utils.decode_sequence(vocab, seq)
+    local sents = {}
+    for k=1,opt.batch_size do
+      table.insert(sents, all_sents[(k-1)*opt.seq_per_img+1])
+    end
+
     for k=1,#sents do
       local entry = {image_id = data.infos[k].id, caption = sents[k]}
       table.insert(predictions, entry)
@@ -227,12 +241,13 @@ local function lossFun()
   -- get batch of data  
   local data = loader:getBatch{batch_size = opt.batch_size, split = 'train', seq_per_img = opt.seq_per_img}
   data.feats = data.feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
-  data.feats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
   data.feats = data.feats:cuda()
+  local avgfeats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
+  data.labels = data.labels:cuda()
   -- we have to expand out image features, once for each sentence
-  local expanded_feats = protos.expander:forward(data.feats)
+  local expanded_feats = protos.expander:forward(avgfeats)
   -- forward the language model
-  local logprobs = protos.lm:forward{expanded_feats, data.labels}
+  local logprobs = protos.lm:forward{expanded_feats, data.feats, data.labels}
   -- forward the language model criterion
   local loss = protos.crit:forward(logprobs, data.labels)
   
@@ -242,30 +257,19 @@ local function lossFun()
   -- backprop criterion
   local dlogprobs = protos.crit:backward(logprobs, data.labels)
   -- backprop language model
-  local dexpanded_feats, ddummy = unpack(protos.lm:backward({expanded_feats, data.labels}, dlogprobs))
-  -- backprop the CNN, but only if we are finetuning
-  if opt.finetune_cnn_after >= 0 and iter >= opt.finetune_cnn_after then
-    local dfeats = protos.expander:backward(feats, dexpanded_feats)
-    local dx = protos.cnn:backward(data.images, dfeats)
-  end
-
-  -- clip gradients
-  -- print(string.format('claming %f%% of gradients', 100*torch.mean(torch.gt(torch.abs(grad_params), opt.grad_clip))))
+  local dexpanded_feats, ddummy = unpack(protos.lm:backward({expanded_feats, data.feats, data.labels}, dlogprobs))
   grad_params:clamp(-opt.grad_clip, opt.grad_clip)
-
-  -- apply L2 regularization
-  if opt.cnn_weight_decay > 0 then
-    cnn_grad_params:add(opt.cnn_weight_decay, cnn_params)
-    -- note: we don't bother adding the l2 loss to the total loss, meh.
-    cnn_grad_params:clamp(-opt.grad_clip, opt.grad_clip)
-  end
-  -----------------------------------------------------------------------------
 
   -- and lets get out!
   local losses = { total_loss = loss }
   return losses
 end
 
+-- print('before: ' .. cutorch.getMemoryUsage()/1e9)
+-- local losses = lossFun()
+-- print('after lossFun: ' .. cutorch.getMemoryUsage()/1e9)
+-- eval_split('val', {val_images_use = opt.val_images_use})
+-- print('after split eval: ' .. cutorch.getMemoryUsage()/1e9)
 -------------------------------------------------------------------------------
 -- Main loop
 -------------------------------------------------------------------------------
