@@ -79,6 +79,7 @@ function adam(x, dx, lr, beta1, beta2, epsilon, state)
   local biasCorrection2 = 1 - beta2^state.t
   local stepSize = lr * math.sqrt(biasCorrection2)/biasCorrection1
   
+  local cool = x
   -- perform update
   x:addcdiv(-stepSize, state.m, state.tmp)
 end
