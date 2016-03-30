@@ -21,10 +21,13 @@ function layer:__init(opt)
   local dropout = utils.getopt(opt, 'dropout', 0)
   -- options for Language Model
   self.seq_length = utils.getopt(opt, 'seq_length')
+  self.seq_per_img = utils.getopt(opt, 'seq_per_img')
+  self.batch_size = utils.getopt(opt, 'batch_size')
   -- create the core lstm network. note +1 for both the START and END tokens
   self.core = LSTM.lstm(self.input_encoding_size, self.vocab_size + 1, 512, self.rnn_size, self.num_layers, dropout)
   self.lookup_table = nn.LookupTable(self.vocab_size + 1, self.input_encoding_size)
-  self.att = Attention.att(16, 5, 196, 512, 512, self.rnn_size, dropout)
+  -- self.att = Attention.att(self.batch_size, self.seq_per_img, 196, 512, 512, self.rnn_size, dropout)
+  self.att = Attention.att(self.batch_size*self.seq_per_img, 196, 512, self.rnn_size, dropout)
   self:_createInitState(1) -- will be lazily resized later during forward passes
 end
 
@@ -107,7 +110,7 @@ where D is sequence length and N is batch (so columns are sequences)
 --]]
 function layer:sample(avg_context, feats, opt)
   local sample_max = utils.getopt(opt, 'sample_max', 1)
-  local beam_size = utils.getopt(opt, 'beam_size', 10)
+  local beam_size = utils.getopt(opt, 'beam_size', 0)
   local temperature = utils.getopt(opt, 'temperature', 1.0)
   if sample_max == 1 and beam_size > 1 then return self:sample_beam(avg_context, feats, opt) end -- indirection for beam search
 
@@ -204,7 +207,6 @@ function layer:sample_beam(avg_context, feats, opt)
         xt = self.lookup_table:forward(it)
       else
         -- local featsk = feats[{{k,k}}]:expand(beam_size, feats:size(2), feats:size(3))
-        print(feats:size())
         local all_context = self.att:forward{feats, state[self.num_state]}
         local context = all_context[{{k,k}}]:expand(beam_size, feats:size(2), feats:size(3))
         --[[
@@ -303,7 +305,6 @@ function layer:updateOutput(input)
   self.tmax = 0 -- we will keep track of max sequence length encountered in the data for efficiency
   self.att_inputs = {}
   for t=1,self.seq_length+1 do
-
     local can_skip = false
     local xt
     local context
@@ -330,16 +331,12 @@ function layer:updateOutput(input)
         local feats = input[2]
         self.att_inputs[t] = {feats,self.state[t-1][#self.state[t-1]]}
         context = self.att_clones[t]:forward(self.att_inputs[t])
-
       end
     end
 
     if not can_skip then
       -- construct the inputs
       self.inputs[t] = {xt,context,unpack(self.state[t-1])}
-      -- print(xt:size())
-      -- print(context:size())
-      -- forward the network
       local out = self.clones[t]:forward(self.inputs[t])
       -- process the outputs
       self.output[t] = out[self.num_state+1] -- last element is the output vector

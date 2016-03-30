@@ -190,7 +190,7 @@ local function eval_split(split, evalopt)
     loss_evals = loss_evals + 1
 
     -- forward the model to also get generated samples for each image
-    local seq = protos.lm:sample(feats)
+    local seq = protos.lm:sample(feats, {beam_size=10})
     local sents = net_utils.decode_sequence(vocab, seq)
     for k=1,#sents do
       local entry = {image_id = data.infos[k].id, caption = sents[k]}

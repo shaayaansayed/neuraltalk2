@@ -87,7 +87,6 @@ end
 -- Create the Data Loader instance
 -------------------------------------------------------------------------------
 local loader = DataLoader{h5_file = opt.input_h5, json_file = opt.input_json, feats_dir = opt.feats_dir}
-
 -------------------------------------------------------------------------------
 -- Initialize the networks
 -------------------------------------------------------------------------------
@@ -98,9 +97,6 @@ if string.len(opt.start_from) > 0 then
   print('initializing weights from ' .. opt.start_from)
   local loaded_checkpoint = torch.load(opt.start_from)
   protos = loaded_checkpoint.protos
-  net_utils.unsanitize_gradients(protos.cnn)
-  local lm_modules = protos.lm:getModulesList()
-  for k,v in pairs(lm_modules) do net_utils.unsanitize_gradients(v) end
   protos.crit = nn.LanguageModelCriterion() -- not in checkpoints, create manually
   protos.expander = nn.FeatExpander(opt.seq_per_img) -- not in checkpoints, create manually
 else
@@ -114,12 +110,11 @@ else
   lmOpt.dropout = opt.drop_prob_lm
   lmOpt.seq_length = loader:getSeqLength()
   lmOpt.batch_size = opt.batch_size * opt.seq_per_img
+  lmOpt.seq_per_img = opt.seq_per_img
+  lmOpt.batch_size = opt.batch_size
   protos.lm = nn.LanguageModel(lmOpt)
-  -- initialize a special FeatExpander module that "corrects" for the batch number discrepancy 
-  -- where we have multiple captions per one image in a batch. This is done for efficiency
-  -- because doing a CNN forward pass is expensive. We expand out the CNN features for each sentence
-  protos.expander = nn.FeatExpander(opt.seq_per_img)
-  -- criterion for the language model
+  protos.expander2d = nn.FeatExpander(opt.seq_per_img, 2)
+  protos.expander3d = nn.FeatExpander(opt.seq_per_img, 3)
   protos.crit = nn.LanguageModelCriterion()
 end
 
@@ -137,12 +132,12 @@ assert(params:nElement() == grad_params:nElement())
 -- construct thin module clones that share parameters with the actual
 -- modules. These thin module will have no intermediates and will be used
 -- for checkpointing to write significantly smaller checkpoint files
-local thin_lm = protos.lm:clone()
-thin_lm.core:share(protos.lm.core, 'weight', 'bias') -- TODO: we are assuming that LM has specific members! figure out clean way to get rid of, not modular.
-thin_lm.lookup_table:share(protos.lm.lookup_table, 'weight', 'bias')
--- sanitize all modules of gradient storage so that we dont save big checkpoints
-local lm_modules = thin_lm:getModulesList()
-for k,v in pairs(lm_modules) do net_utils.sanitize_gradients(v) end
+-- local thin_lm = protos.lm:clone()
+-- thin_lm.core:share(protos.lm.core, 'weight', 'bias') -- TODO: we are assuming that LM has specific members! figure out clean way to get rid of, not modular.
+-- thin_lm.lookup_table:share(protos.lm.lookup_table, 'weight', 'bias')
+-- -- sanitize all modules of gradient storage so that we dont save big checkpoints
+-- local lm_modules = thin_lm:getModulesList()
+-- for k,v in pairs(lm_modules) do net_utils.sanitize_gradients(v) end
 
 -- create clones and ensure parameter sharing. we have to do this 
 -- all the way here at the end because calls such as :cuda() and
@@ -173,7 +168,7 @@ local function eval_split(split, evalopt)
     local avgfeats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
     n = n + data.feats:size(1)
     data.labels = data.labels:cuda()
-
+    data.feats = protos.expander3d:forward(data.feats)
     -- local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
     -- local feats = data.feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
     -- local avgfeats = torch.sum(torch.div(feats, 196), 2):select(2,1) -- 16x512
@@ -182,7 +177,7 @@ local function eval_split(split, evalopt)
     -- feats = feats:cuda()
     -- avgfeats = avgfeats:cuda()
 
-    local expanded_feats = protos.expander:forward(avgfeats)
+    local expanded_feats = protos.expander2d:forward(avgfeats)
     local logprobs = protos.lm:forward{expanded_feats, data.feats, data.labels}
     local loss = protos.crit:forward(logprobs, data.labels)
     loss_sum = loss_sum + loss
@@ -244,8 +239,9 @@ local function lossFun()
   data.feats = data.feats:cuda()
   local avgfeats = torch.sum(torch.div(data.feats, 196), 2):select(2,1) -- 16x512
   data.labels = data.labels:cuda()
+  data.feats = protos.expander3d:forward(data.feats)
   -- we have to expand out image features, once for each sentence
-  local expanded_feats = protos.expander:forward(avgfeats)
+  local expanded_feats = protos.expander2d:forward(avgfeats)
   -- forward the language model
   local logprobs = protos.lm:forward{expanded_feats, data.feats, data.labels}
   -- forward the language model criterion
@@ -260,16 +256,14 @@ local function lossFun()
   local dexpanded_feats, ddummy = unpack(protos.lm:backward({expanded_feats, data.feats, data.labels}, dlogprobs))
   grad_params:clamp(-opt.grad_clip, opt.grad_clip)
 
+  freeMemory, totalMemory = cutorch.getMemoryUsage(opt.gpuid+1)
+  print('Free Memory: ' .. freeMemory/1e9)
+
   -- and lets get out!
   local losses = { total_loss = loss }
   return losses
 end
 
--- print('before: ' .. cutorch.getMemoryUsage()/1e9)
--- local losses = lossFun()
--- print('after lossFun: ' .. cutorch.getMemoryUsage()/1e9)
--- eval_split('val', {val_images_use = opt.val_images_use})
--- print('after split eval: ' .. cutorch.getMemoryUsage()/1e9)
 -------------------------------------------------------------------------------
 -- Main loop
 -------------------------------------------------------------------------------
@@ -327,8 +321,7 @@ while true do
       if iter > 0 then -- dont save on very first iteration
         -- include the protos (which have weights) and save to file
         local save_protos = {}
-        save_protos.lm = thin_lm -- these are shared clones, and point to correct param storage
-        save_protos.cnn = thin_cnn
+        save_protos.lm = protos.lm -- these are shared clones, and point to correct param storage
         checkpoint.protos = save_protos
         -- also include the vocabulary mapping so that we can use the checkpoint 
         -- alone to run on arbitrary images without the data loader
