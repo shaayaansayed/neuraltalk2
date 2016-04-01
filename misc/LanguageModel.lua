@@ -5,10 +5,6 @@ local net_utils = require 'misc.net_utils'
 local LSTM = require 'misc.LSTM'
 local Attention = require 'misc.Attention'
 
--------------------------------------------------------------------------------
--- Language Model core
--------------------------------------------------------------------------------
-
 local layer, parent = torch.class('nn.LanguageModel', 'nn.Module')
 function layer:__init(opt)
   parent.__init(self)
@@ -19,6 +15,7 @@ function layer:__init(opt)
   self.rnn_size = utils.getopt(opt, 'rnn_size')
   self.num_layers = utils.getopt(opt, 'num_layers', 1)
   local dropout = utils.getopt(opt, 'dropout', 0)
+
   -- options for Language Model
   self.seq_length = utils.getopt(opt, 'seq_length')
   self.seq_per_img = utils.getopt(opt, 'seq_per_img')
@@ -110,7 +107,7 @@ where D is sequence length and N is batch (so columns are sequences)
 --]]
 function layer:sample(avg_context, feats, opt)
   local sample_max = utils.getopt(opt, 'sample_max', 1)
-  local beam_size = utils.getopt(opt, 'beam_size', 0)
+  local beam_size = utils.getopt(opt, 'beam_size', 1)
   local temperature = utils.getopt(opt, 'temperature', 1.0)
   if sample_max == 1 and beam_size > 1 then return self:sample_beam(avg_context, feats, opt) end -- indirection for beam search
 
@@ -181,9 +178,8 @@ function layer:sample_beam(avg_context, feats, opt)
 
   local seq = torch.LongTensor(self.seq_length, batch_size):zero()
   local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
-
+ 
   for k=1,batch_size do
-    -- create initial states for all beams
     self:_createInitState(beam_size)
     local state = self.init_state
 
@@ -206,15 +202,9 @@ function layer:sample_beam(avg_context, feats, opt)
         it = torch.LongTensor(beam_size):fill(self.vocab_size+1)
         xt = self.lookup_table:forward(it)
       else
-        -- local featsk = feats[{{k,k}}]:expand(beam_size, feats:size(2), feats:size(3))
         local all_context = self.att:forward{feats, state[self.num_state]}
         local context = all_context[{{k,k}}]:expand(beam_size, feats:size(2), feats:size(3))
-        --[[
-          perform a beam merge. that is,
-          for every previous beam we now many new possibilities to branch out
-          we need to resort our beams to maintain the loop invariant of keeping
-          the top beam_size most likely sequences.
-        ]]--
+
         local logprobsf = logprobs:float() -- lets go to CPU for more efficiency in indexing operations
         ys,ix = torch.sort(logprobsf,2,true) -- sorted array of logprobs along each previous beam (last true = descending)
         local candidates = {}

@@ -90,6 +90,8 @@ function layer:updateOutput(input)
   if self.dim == 2 then
     assert(input:nDimension() == 2)
     local d = input:size(2)
+    print(input:size())
+    print(self.n)
     self.output:resize(input:size(1)*self.n, d)
     for k=1,input:size(1) do
       local j = (k-1)*self.n+1
