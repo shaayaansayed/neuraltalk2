@@ -119,7 +119,6 @@ else
   if opt.gpuid == -1 then cnn_backend = 'nn' end -- override to nn if gpu is disabled
   local cnn_raw = loadcaffe.load(opt.cnn_proto, opt.cnn_model, cnn_backend)
   protos.cnn = net_utils.build_cnn(cnn_raw, {encoding_size = opt.input_encoding_size, backend = cnn_backend})
-  -- protos.expander2d = nn.FeatExpander(opt.seq_per_img, 2)
   protos.expander3d = nn.FeatExpander(opt.seq_per_img, 3)
   protos.crit = nn.LanguageModelCriterion()
 end
@@ -167,7 +166,7 @@ local function eval_split(split, evalopt)
   local vocab = loader:getVocab()
   while true do
 
-    local data = loader:getBatch{batch_size = opt.batch_size, split = 'train', seq_per_img = opt.seq_per_img}
+    local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
     data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0)
     data.labels = data.labels:cuda()
 
@@ -183,7 +182,6 @@ local function eval_split(split, evalopt)
     loss_sum = loss_sum + loss
     loss_evals = loss_evals + 1
 
-    -- forward the model to also get generated samples for each image
     local seq = protos.lm:sample(avgfeats, feats, {beam_size = opt.beam_size})
     local all_sents = net_utils.decode_sequence(vocab, seq)
     local sents = {}

@@ -25,20 +25,21 @@ cmd:option('-model','','path to model to evaluate')
 cmd:option('-batch_size', 1, 'if > 0 then overrule, otherwise load from checkpoint.')
 cmd:option('-num_images', 100, 'how many images to use when periodically evaluating the loss? (-1 = all)')
 cmd:option('-language_eval', 0, 'Evaluate language as well (1 = yes, 0 = no)? BLEU/CIDEr/METEOR/ROUGE_L? requires coco-caption code from Github.')
-cmd:option('-dump_images', 1, 'Dump images into vis/imgs folder for vis? (1=yes,0=no)')
+cmd:option('-dump_images', 0, 'Dump images into vis/imgs folder for vis? (1=yes,0=no)')
 cmd:option('-dump_json', 1, 'Dump json with predictions into vis folder? (1=yes,0=no)')
 cmd:option('-dump_path', 0, 'Write image paths along with predictions into vis json? (1=yes,0=no)')
 -- Sampling options
 cmd:option('-sample_max', 1, '1 = sample argmax words. 0 = sample from distributions.')
-cmd:option('-beam_size', 2, 'used when sample_max = 1, indicates number of beams in beam search. Usually 2 or 3 works well. More is not better. Set this to 1 for faster runtime but a bit worse performance.')
+cmd:option('-beam_size', 0, 'used when sample_max = 1, indicates number of beams in beam search. Usually 2 or 3 works well. More is not better. Set this to 1 for faster runtime but a bit worse performance.')
 cmd:option('-temperature', 1.0, 'temperature when sampling from distributions (i.e. when sample_max = 0). Lower = "safer" predictions.')
 -- For evaluation on a folder of images:
 cmd:option('-image_folder', '', 'If this is nonempty then will predict on the images in this folder path')
 cmd:option('-image_root', '', 'In case the image paths have to be preprended with a root path to an image folder')
 -- For evaluation on MSCOCO images from some split:
-cmd:option('-input_h5','','path to the h5file containing the preprocessed dataset. empty = fetch from model checkpoint.')
-cmd:option('-input_json','','path to the json file containing additional info and vocab. empty = fetch from model checkpoint.')
-cmd:option('-split', 'test', 'if running on MSCOCO images, which split to use: val|test|train')
+cmd:option('-input_h5','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.h5','path to the h5file containing the preprocessed dataset')
+cmd:option('-input_json','/scratch/cluster/vsub/ssayed/MSCOCO/cocotalk.json','path to the json file containing additional info and vocab')
+-- cmd:option('-input_json','','path to the json file containing additional info and vocab. empty = fetch from model checkpoint.')
+cmd:option('-split', 'val', 'if running on MSCOCO images, which split to use: val|test|train')
 cmd:option('-coco_json', '', 'if nonempty then use this file in DataLoaderRaw (see docs there). Used only in MSCOCO test evaluation, where we have a specific json file of only test set images.')
 -- misc
 cmd:option('-backend', 'cudnn', 'nn|cudnn')
@@ -62,9 +63,6 @@ if opt.gpuid >= 0 then
   cutorch.setDevice(opt.gpuid + 1) -- note +1 because lua is 1-indexed
 end
 
--------------------------------------------------------------------------------
--- Load the model checkpoint to evaluate
--------------------------------------------------------------------------------
 assert(string.len(opt.model) > 0, 'must provide a model')
 local checkpoint = torch.load(opt.model)
 -- override and collect parameters
@@ -91,7 +89,7 @@ end
 -- Load the networks from model checkpoint
 -------------------------------------------------------------------------------
 local protos = checkpoint.protos
-protos.expander = nn.FeatExpander(opt.seq_per_img)
+protos.expander3d = nn.FeatExpander(opt.seq_per_img, 3)
 protos.crit = nn.LanguageModelCriterion()
 protos.lm:createClones() -- reconstruct clones inside the language model
 if opt.gpuid >= 0 then for k,v in pairs(protos) do v:cuda() end end
@@ -114,26 +112,35 @@ local function eval_split(split, evalopt)
 
     -- fetch a batch of data
     local data = loader:getBatch{batch_size = opt.batch_size, split = split, seq_per_img = opt.seq_per_img}
-    data.images = net_utils.prepro(data.images, false, opt.gpuid >= 0) -- preprocess in place, and don't augment
-    n = n + data.images:size(1)
+    data.images = net_utils.prepro(data.images, true, opt.gpuid >= 0)
+    data.labels = data.labels:cuda()
 
-    -- forward the model to get loss
     local feats = protos.cnn:forward(data.images)
+    feats = feats:view(opt.batch_size,512,196):transpose(2,3) -- 16x196x512
+    feats = protos.expander3d:forward(feats)
+    local avgfeats = torch.sum(torch.div(feats, 196), 2):select(2,1) -- 16x512
+
+
+    n = n + data.images:size(1)
 
     -- evaluate loss if we have the labels
     local loss = 0
     if data.labels then
-      local expanded_feats = protos.expander:forward(feats)
-      local logprobs = protos.lm:forward{expanded_feats, data.labels}
+      local logprobs = protos.lm:forward{avgfeats, feats, data.labels}
+      local loss = protos.crit:forward(logprobs, data.labels)
       loss = protos.crit:forward(logprobs, data.labels)
       loss_sum = loss_sum + loss
       loss_evals = loss_evals + 1
     end
 
-    -- forward the model to also get generated samples for each image
     local sample_opts = { sample_max = opt.sample_max, beam_size = opt.beam_size, temperature = opt.temperature }
-    local seq = protos.lm:sample(feats, sample_opts)
-    local sents = net_utils.decode_sequence(vocab, seq)
+    local seq = protos.lm:sample(avgfeats, feats, sample_opts)
+    local all_sents = net_utils.decode_sequence(vocab, seq)
+    local sents = {}
+    for k=1,opt.batch_size do
+      table.insert(sents, all_sents[(k-1)*opt.seq_per_img+1])
+    end
+
     for k=1,#sents do
       local entry = {image_id = data.infos[k].id, caption = sents[k]}
       if opt.dump_path == 1 then

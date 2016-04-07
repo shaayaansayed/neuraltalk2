@@ -119,6 +119,7 @@ function layer:sample(avg_context, feats, opt)
   local seq = torch.LongTensor(self.seq_length, batch_size):zero()
   local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
   local logprobs -- logprobs predicted in last time step
+
   for t=1,self.seq_length+1 do
 
     local xt, it, context, sampleLogprobs
@@ -129,6 +130,14 @@ function layer:sample(avg_context, feats, opt)
       xt = self.lookup_table:forward(it)
     else
       context = self.att:forward{feats, state[self.num_state]}
+
+      for _,node in ipairs(self.att.forwardnodes) do
+        print('cool')
+        if node.data.annotations.name == "scores" then
+          print(node.data.module)
+          -- print(node.data.module.output)
+        end
+      end
 
       -- take predictions from previous time step and feed them in
       if sample_max == 1 then
@@ -174,12 +183,12 @@ function layer:sample_beam(avg_context, feats, opt)
   print('sample beam...')
 
   assert(beam_size <= self.vocab_size+1, 'lets assume this for now, otherwise this corner case causes a few headaches down the road. can be dealt with in future if needed')
-  local seq_per_img = 5
 
   local seq = torch.LongTensor(self.seq_length, batch_size):zero()
   local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
- 
+  print(batch_size)
   for k=1,batch_size do
+    print(k)
     self:_createInitState(beam_size)
     local state = self.init_state
 
@@ -196,14 +205,13 @@ function layer:sample_beam(avg_context, feats, opt)
       local context
       if t == 1 then
         -- feed in the images
-        local ix = (k-1)*seq_per_img + 1
-        context = avg_context[{ {ix,ix} }]:expand(beam_size, context_size) 
+        context = avg_context[{ {k,k} }]:expand(beam_size, context_size) 
 
         it = torch.LongTensor(beam_size):fill(self.vocab_size+1)
         xt = self.lookup_table:forward(it)
       else
         local all_context = self.att:forward{feats, state[self.num_state]}
-        local context = all_context[{{k,k}}]:expand(beam_size, feats:size(2), feats:size(3))
+        context = all_context[{{k,k}}]:expand(beam_size, context_size)
 
         local logprobsf = logprobs:float() -- lets go to CPU for more efficiency in indexing operations
         ys,ix = torch.sort(logprobsf,2,true) -- sorted array of logprobs along each previous beam (last true = descending)
