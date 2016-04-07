@@ -26,7 +26,7 @@ function Attention.att(batch_size, num_annotations, annotation_size, rnn_size, d
   sum = nn.View(batch_size*num_annotations, rnn_size)(sum)
   local annotation_scores = nn.Linear(rnn_size, 1)(sum) -- batch_size*num_annotations x 1 
   annotation_scores = nn.View(batch_size, -1)(annotation_scores) -- batch_size x num_annotations
-  annotation_scores = nn.SoftMax(2)(annotation_scores) -- batch_size x num_annotations
+  annotation_scores = nn.SoftMax(2)(annotation_scores):annotate{name='scores'} -- batch_size x num_annotations
   annotation_scores = nn.Replicate(annotation_size, 3)(annotation_scores) -- batch_size x num_annotations x annotation_size
 
   local weighted_annotations = nn.CMulTable()({annotation_scores, img})
