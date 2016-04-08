@@ -13,7 +13,6 @@ function layer:__init(opt)
   self.vocab_size = utils.getopt(opt, 'vocab_size') -- required
   self.input_encoding_size = utils.getopt(opt, 'input_encoding_size')
   self.rnn_size = utils.getopt(opt, 'rnn_size')
-  self.num_layers = utils.getopt(opt, 'num_layers', 1)
   local dropout = utils.getopt(opt, 'dropout', 0)
 
   -- options for Language Model
@@ -21,28 +20,21 @@ function layer:__init(opt)
   self.seq_per_img = utils.getopt(opt, 'seq_per_img')
   self.batch_size = utils.getopt(opt, 'batch_size')
   -- create the core lstm network. note +1 for both the START and END tokens
-  self.core = LSTM.lstm(self.input_encoding_size, self.vocab_size + 1, 512, self.rnn_size, self.num_layers, dropout)
+  self.core = LSTM.lstm(self.input_encoding_size, self.vocab_size + 1, 512, self.rnn_size, self.batch_size*self.seq_per_img, dropout)
   self.lookup_table = nn.LookupTable(self.vocab_size + 1, self.input_encoding_size)
   -- self.att = Attention.att(self.batch_size, self.seq_per_img, 196, 512, 512, self.rnn_size, dropout)
   self.att = Attention.att(self.batch_size*self.seq_per_img, 196, 512, self.rnn_size, dropout)
-  self:_createInitState(1) -- will be lazily resized later during forward passes
+  -- self:_createInitState(1) -- will be lazily resized later during forward passes
 end
 
 function layer:_createInitState(batch_size)
   assert(batch_size ~= nil, 'batch size must be provided')
   -- construct the initial state for the LSTM
-  if not self.init_state then self.init_state = {} end -- lazy init
-  for h=1,self.num_layers*2 do
-    -- note, the init state Must be zeros because we are using init_state to init grads in backward call too
-    if self.init_state[h] then
-      if self.init_state[h]:size(1) ~= batch_size then
-        self.init_state[h]:resize(batch_size, self.rnn_size):zero() -- expand the memory
-      end
-    else
-      self.init_state[h] = torch.zeros(batch_size, self.rnn_size)
-    end
-  end
-  self.num_state = #self.init_state
+  self.c_tape = {}
+  self.h_tape = {}
+
+  self.c_tape[1] = torch.zeros(batch_size, self.rnn_size)
+  self.h_tape[1] = torch.zeros(batch_size, self.rnn_size)
 end
 
 function layer:createClones()
@@ -289,10 +281,10 @@ function layer:updateOutput(input)
   
   self:_createInitState(batch_size)
 
-  self.state = {[0] = self.init_state}
   self.inputs = {}
   self.lookup_tables_inputs = {}
   self.tmax = 0 -- we will keep track of max sequence length encountered in the data for efficiency
+
   self.att_inputs = {}
   for t=1,self.seq_length+1 do
     local can_skip = false
@@ -319,19 +311,19 @@ function layer:updateOutput(input)
         xt = self.lookup_tables[t]:forward(it)
 
         local feats = input[2]
-        self.att_inputs[t] = {feats,self.state[t-1][#self.state[t-1]]}
+        self.att_inputs[t] = {feats, self.h_tape[#self.h_tape]}
         context = self.att_clones[t]:forward(self.att_inputs[t])
       end
     end
 
     if not can_skip then
       -- construct the inputs
-      self.inputs[t] = {xt,context,unpack(self.state[t-1])}
+      self.inputs[t] = {xt,context,utils.clone_list(self.c_tape),utils.clone_list(self.h_tape)}
       local out = self.clones[t]:forward(self.inputs[t])
+      table.insert(self.c_tape, out[1])
+      table.insert(self.h_tape, out[2])
       -- process the outputs
-      self.output[t] = out[self.num_state+1] -- last element is the output vector
-      self.state[t] = {} -- the rest is state
-      for i=1,self.num_state do table.insert(self.state[t], out[i]) end
+      self.output[t] = out[3] -- last element is the output vector
       self.tmax = t
     end
   end
@@ -346,25 +338,30 @@ function layer:updateGradInput(input, gradOutput)
   local dimgs -- grad on input images
 
   -- go backwards and lets compute gradients
-  local dstate = {[self.tmax] = self.init_state} -- this works when init_state is all zeros
+  local d_ctape = utils.clone_list(self.c_tape, true)
+  local d_htape = utils.clone_list(self.h_tape, true)
+
   for t=self.tmax,1,-1 do
-    -- concat state gradients and output vector gradients at time step t
+    print(t)
     local dout = {}
-    for k=1,#dstate[t] do table.insert(dout, dstate[t][k]) end
+    table.insert(dout, d_ctape[t+1])
+    table.insert(dout, d_htape[t+1])
     table.insert(dout, gradOutput[t])
     local dinputs = self.clones[t]:backward(self.inputs[t], dout)
-    -- split the gradient to xt and to state
-    local dxt = dinputs[1] -- first element is the input vector
-    dstate[t-1] = {} -- copy over rest to state grad
-    for k=3,self.num_state+2 do table.insert(dstate[t-1], dinputs[k]) end
+
+    for k=1,t do
+      d_ctape[k]:add(dinputs[3][k])
+      d_htape[k]:add(dinputs[4][k])
+    end
 
     if t ~= 1 then 
       local dcontext = dinputs[2]
       local datt = self.att_clones[t]:backward(self.att_inputs[t], dcontext)
-      dstate[t-1][self.num_state]:add(datt[2])
+      d_htape[t-1]:add(datt[2])
+      dinputs[1]:add(datt[1])
     end
 
-    local dxt = dinputs[2]
+    local dxt = dinputs[1]
     local it = self.lookup_tables_inputs[t]
     self.lookup_tables[t]:backward(it, dxt) 
   end
