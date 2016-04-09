@@ -24,7 +24,7 @@ function layer:__init(opt)
   self.core = LSTM.lstm(self.input_encoding_size, self.vocab_size + 1, 512, self.rnn_size, self.num_layers, dropout)
   self.lookup_table = nn.LookupTable(self.vocab_size + 1, self.input_encoding_size)
   -- self.att = Attention.att(self.batch_size, self.seq_per_img, 196, 512, 512, self.rnn_size, dropout)
-  self.att = Attention.att(self.batch_size*self.seq_per_img, 196, 512, self.rnn_size, dropout)
+  self.att = Attention.att(self.batch_size*self.seq_per_img, 196, 512, self.rnn_size, self.input_encoding_size, dropout)
   self:_createInitState(1) -- will be lazily resized later during forward passes
 end
 
@@ -129,15 +129,13 @@ function layer:sample(avg_context, feats, opt)
       it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
       xt = self.lookup_table:forward(it)
     else
-      context = self.att:forward{feats, state[self.num_state]}
-
-      for _,node in ipairs(self.att.forwardnodes) do
-        print('cool')
-        if node.data.annotations.name == "scores" then
-          print(node.data.module)
-          -- print(node.data.module.output)
-        end
-      end
+      -- for _,node in ipairs(self.att.forwardnodes) do
+      --   print('cool')
+      --   if node.data.annotations.name == "scores" then
+      --     print(node.data.module)
+      --     -- print(node.data.module.output)
+      --   end
+      -- end
 
       -- take predictions from previous time step and feed them in
       if sample_max == 1 then
@@ -158,6 +156,7 @@ function layer:sample(avg_context, feats, opt)
         it = it:view(-1):long() -- and flatten indices for downstream processing
       end
       xt = self.lookup_table:forward(it)
+      context = self.att:forward{feats, state[self.num_state], xt}
     end
 
     if t >= 2 then 
@@ -327,7 +326,7 @@ function layer:updateOutput(input)
         xt = self.lookup_tables[t]:forward(it)
 
         local feats = input[2]
-        self.att_inputs[t] = {feats,self.state[t-1][#self.state[t-1]]}
+        self.att_inputs[t] = {feats,self.state[t-1][#self.state[t-1]], xt}
         context = self.att_clones[t]:forward(self.att_inputs[t])
       end
     end
@@ -362,7 +361,6 @@ function layer:updateGradInput(input, gradOutput)
     table.insert(dout, gradOutput[t])
     local dinputs = self.clones[t]:backward(self.inputs[t], dout)
     -- split the gradient to xt and to state
-    local dxt = dinputs[1] -- first element is the input vector
     dstate[t-1] = {} -- copy over rest to state grad
     for k=3,self.num_state+2 do table.insert(dstate[t-1], dinputs[k]) end
 
@@ -370,9 +368,10 @@ function layer:updateGradInput(input, gradOutput)
       local dcontext = dinputs[2]
       local datt = self.att_clones[t]:backward(self.att_inputs[t], dcontext)
       dstate[t-1][self.num_state]:add(datt[2])
+      dinputs[1]:add(datt[3])
     end
 
-    local dxt = dinputs[2]
+    local dxt = dinputs[1]
     local it = self.lookup_tables_inputs[t]
     self.lookup_tables[t]:backward(it, dxt) 
   end
