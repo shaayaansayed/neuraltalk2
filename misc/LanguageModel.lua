@@ -23,7 +23,7 @@ function layer:__init(opt)
   self.core = LSTM.lstm(self.input_encoding_size, self.vocab_size + 1, 512, self.rnn_size, self.batch_size*self.seq_per_img, dropout)
   self.lookup_table = nn.LookupTable(self.vocab_size + 1, self.input_encoding_size)
   -- self.att = Attention.att(self.batch_size, self.seq_per_img, 196, 512, 512, self.rnn_size, dropout)
-  self.att = Attention.att(self.batch_size*self.seq_per_img, 196, 512, self.rnn_size, dropout)
+  self.att = Attention.att(self.batch_size*self.seq_per_img, 196, 512, self.rnn_size, self.input_encoding_size, dropout)
   -- self:_createInitState(1) -- will be lazily resized later during forward passes
 end
 
@@ -112,7 +112,6 @@ function layer:sample(avg_context, feats, opt)
   local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
   local logprobs -- logprobs predicted in last time step
   for t=1,self.seq_length+1 do
-
     local xt, it, context, sampleLogprobs
     if t == 1 then
       context = avg_context
@@ -120,9 +119,6 @@ function layer:sample(avg_context, feats, opt)
       it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
       xt = self.lookup_table:forward(it)
     else
-      context = self.att:forward{feats, state[self.num_state]}
-
-      -- take predictions from previous time step and feed them in
       if sample_max == 1 then
         -- use argmax "sampling"
         sampleLogprobs, it = torch.max(logprobs, 2)
@@ -141,6 +137,7 @@ function layer:sample(avg_context, feats, opt)
         it = it:view(-1):long() -- and flatten indices for downstream processing
       end
       xt = self.lookup_table:forward(it)
+      context = self.att_clones[t]:forward{feats, self.h_tape[#self.h_tape], xt}
     end
 
     if t >= 2 then 
@@ -148,126 +145,13 @@ function layer:sample(avg_context, feats, opt)
       seqLogprobs[t-1] = sampleLogprobs:view(-1):float() -- and also their log likelihoods
     end
 
-    local inputs = {xt,context,unpack(state)}
+    local inputs = {xt,context,utils.clone_list(self.c_tape),utils.clone_list(self.h_tape)}
     local out = self.core:forward(inputs)
-    logprobs = out[self.num_state+1] -- last element is the output vector
-    state = {}
-    for i=1,self.num_state do table.insert(state, out[i]) end
+    table.insert(self.c_tape, out[1])
+    table.insert(self.h_tape, out[2])
+    logprobs = out[#out] 
   end
 
-  -- return the samples and their log likelihoods
-  return seq, seqLogprobs
-end
-
-function layer:sample_beam(avg_context, feats, opt)
-  local beam_size = utils.getopt(opt, 'beam_size', 10)
-  local batch_size, context_size = feats:size(1), avg_context:size(2)
-  local function compare(a,b) return a.p > b.p end -- used downstream
-  print('sample beam...')
-
-  assert(beam_size <= self.vocab_size+1, 'lets assume this for now, otherwise this corner case causes a few headaches down the road. can be dealt with in future if needed')
-  local seq_per_img = 5
-
-  local seq = torch.LongTensor(self.seq_length, batch_size):zero()
-  local seqLogprobs = torch.FloatTensor(self.seq_length, batch_size)
- 
-  for k=1,batch_size do
-    self:_createInitState(beam_size)
-    local state = self.init_state
-
-    -- we will write output predictions into tensor seq
-    local beam_seq = torch.LongTensor(self.seq_length, beam_size):zero()
-    local beam_seq_logprobs = torch.FloatTensor(self.seq_length, beam_size):zero()
-    local beam_logprobs_sum = torch.zeros(beam_size) -- running sum of logprobs for each beam
-    local logprobs -- logprobs predicted in last time step, shape (beam_size, vocab_size+1)
-    local done_beams = {}
-    for t=1,self.seq_length+1 do
-
-      local xt, it, sampleLogprobs
-      local new_state
-      local context
-      if t == 1 then
-        -- feed in the images
-        local ix = (k-1)*seq_per_img + 1
-        context = avg_context[{ {ix,ix} }]:expand(beam_size, context_size) 
-
-        it = torch.LongTensor(beam_size):fill(self.vocab_size+1)
-        xt = self.lookup_table:forward(it)
-      else
-        local all_context = self.att:forward{feats, state[self.num_state]}
-        local context = all_context[{{k,k}}]:expand(beam_size, feats:size(2), feats:size(3))
-
-        local logprobsf = logprobs:float() -- lets go to CPU for more efficiency in indexing operations
-        ys,ix = torch.sort(logprobsf,2,true) -- sorted array of logprobs along each previous beam (last true = descending)
-        local candidates = {}
-        local cols = math.min(beam_size,ys:size(2))
-        local rows = beam_size
-        if t == 2 then rows = 1 end -- at first time step only the first beam is active
-        for c=1,cols do -- for each column (word, essentially)
-          for q=1,rows do -- for each beam expansion
-            -- compute logprob of expanding beam q with word in (sorted) position c
-            local local_logprob = ys[{ q,c }]
-            local candidate_logprob = beam_logprobs_sum[q] + local_logprob
-            table.insert(candidates, {c=ix[{ q,c }], q=q, p=candidate_logprob, r=local_logprob })
-          end
-        end
-        table.sort(candidates, compare) -- find the best c,q pairs
-
-        -- construct new beams
-        new_state = net_utils.clone_list(state)
-        local beam_seq_prev, beam_seq_logprobs_prev
-        if t > 2 then
-          -- well need these as reference when we fork beams around
-          beam_seq_prev = beam_seq[{ {1,t-2}, {} }]:clone()
-          beam_seq_logprobs_prev = beam_seq_logprobs[{ {1,t-2}, {} }]:clone()
-        end
-        for vix=1,beam_size do
-          local v = candidates[vix]
-          -- fork beam index q into index vix
-          if t > 2 then
-            beam_seq[{ {1,t-2}, vix }] = beam_seq_prev[{ {}, v.q }]
-            beam_seq_logprobs[{ {1,t-2}, vix }] = beam_seq_logprobs_prev[{ {}, v.q }]
-          end
-          -- rearrange recurrent states
-          for state_ix = 1,#new_state do
-            -- copy over state in previous beam q to new beam at vix
-            new_state[state_ix][vix] = state[state_ix][v.q]
-          end
-          -- append new end terminal at the end of this beam
-          beam_seq[{ t-1, vix }] = v.c -- c'th word is the continuation
-          beam_seq_logprobs[{ t-1, vix }] = v.r -- the raw logprob here
-          beam_logprobs_sum[vix] = v.p -- the new (sum) logprob along this beam
-
-          if v.c == self.vocab_size+1 or t == self.seq_length+1 then
-            -- END token special case here, or we reached the end.
-            -- add the beam to a set of done beams
-            table.insert(done_beams, {seq = beam_seq[{ {}, vix }]:clone(), 
-                                      logps = beam_seq_logprobs[{ {}, vix }]:clone(),
-                                      p = beam_logprobs_sum[vix]
-                                     })
-          end
-        end
-        
-        -- encode as vectors
-        it = beam_seq[t-1]
-        xt = self.lookup_table:forward(it)
-      end
-
-      if new_state then state = new_state end -- swap rnn state, if we reassinged beams
-
-      local inputs = {xt,context,unpack(state)}
-      local out = self.core:forward(inputs)
-      logprobs = out[self.num_state+1] -- last element is the output vector
-      state = {}
-      for i=1,self.num_state do table.insert(state, out[i]) end
-    end
-
-    table.sort(done_beams, compare)
-    seq[{ {}, k }] = done_beams[1].seq -- the first beam has highest cumulative score
-    seqLogprobs[{ {}, k }] = done_beams[1].logps
-  end
-
-  -- return the samples and their log likelihoods
   return seq, seqLogprobs
 end
 
@@ -283,7 +167,7 @@ function layer:updateOutput(input)
 
   self.inputs = {}
   self.lookup_tables_inputs = {}
-  self.tmax = 0 -- we will keep track of max sequence length encountered in the data for efficiency
+  self.tmax = 0
 
   self.att_inputs = {}
   for t=1,self.seq_length+1 do
@@ -295,13 +179,10 @@ function layer:updateOutput(input)
       context = input[1]
       local it = torch.LongTensor(batch_size):fill(self.vocab_size+1)
       self.lookup_tables_inputs[t] = it
-      xt = self.lookup_tables[t]:forward(it) -- NxK sized input (token embedding vectors)
+      xt = self.lookup_tables[t]:forward(it) 
     else
-      -- feed in the rest of the sequence...
       local it = seq[t-1]:clone()
       if torch.sum(it) == 0 then
-        -- computational shortcut for efficiency. All sequences have already terminated and only
-        -- contain null tokens from here on. We can skip the rest of the forward pass and save time
         can_skip = true 
       end
       it[torch.eq(it,0)] = 1
@@ -311,19 +192,17 @@ function layer:updateOutput(input)
         xt = self.lookup_tables[t]:forward(it)
 
         local feats = input[2]
-        self.att_inputs[t] = {feats, self.h_tape[#self.h_tape]}
+        self.att_inputs[t] = {feats, self.h_tape[#self.h_tape], xt}
         context = self.att_clones[t]:forward(self.att_inputs[t])
       end
     end
 
     if not can_skip then
-      -- construct the inputs
       self.inputs[t] = {xt,context,utils.clone_list(self.c_tape),utils.clone_list(self.h_tape)}
       local out = self.clones[t]:forward(self.inputs[t])
       table.insert(self.c_tape, out[1])
       table.insert(self.h_tape, out[2])
-      -- process the outputs
-      self.output[t] = out[3] -- last element is the output vector
+      self.output[t] = out[3] 
       self.tmax = t
     end
   end
@@ -331,9 +210,6 @@ function layer:updateOutput(input)
   return self.output
 end
 
---[[
-gradOutput is an (D+2)xNx(M+1) Tensor.
---]]
 function layer:updateGradInput(input, gradOutput)
   local dimgs -- grad on input images
 
@@ -342,7 +218,6 @@ function layer:updateGradInput(input, gradOutput)
   local d_htape = utils.clone_list(self.h_tape, true)
 
   for t=self.tmax,1,-1 do
-    print(t)
     local dout = {}
     table.insert(dout, d_ctape[t+1])
     table.insert(dout, d_htape[t+1])
@@ -357,8 +232,8 @@ function layer:updateGradInput(input, gradOutput)
     if t ~= 1 then 
       local dcontext = dinputs[2]
       local datt = self.att_clones[t]:backward(self.att_inputs[t], dcontext)
-      d_htape[t-1]:add(datt[2])
-      dinputs[1]:add(datt[1])
+      d_htape[t]:add(datt[2])
+      dinputs[1]:add(datt[3])
     end
 
     local dxt = dinputs[1]
