@@ -346,13 +346,9 @@ function layer:updateOutput(input)
   return self.output
 end
 
---[[
-gradOutput is an (D+2)xNx(M+1) Tensor.
---]]
 function layer:updateGradInput(input, gradOutput)
   local dimgs -- grad on input images
 
-  -- go backwards and lets compute gradients
   local dstate = {[self.tmax] = self.init_state} -- this works when init_state is all zeros
   for t=self.tmax,1,-1 do
     -- concat state gradients and output vector gradients at time step t
@@ -360,7 +356,6 @@ function layer:updateGradInput(input, gradOutput)
     for k=1,#dstate[t] do table.insert(dout, dstate[t][k]) end
     table.insert(dout, gradOutput[t])
     local dinputs = self.clones[t]:backward(self.inputs[t], dout)
-    -- split the gradient to xt and to state
     dstate[t-1] = {} -- copy over rest to state grad
     for k=3,self.num_state+2 do table.insert(dstate[t-1], dinputs[k]) end
 
@@ -376,7 +371,6 @@ function layer:updateGradInput(input, gradOutput)
     self.lookup_tables[t]:backward(it, dxt) 
   end
 
-  -- we have gradient on image, but for LongTensor gt sequence we only create an empty tensor - can't backprop
   self.gradInput = {dimgs, torch.Tensor()}
   return self.gradInput
 end
@@ -402,14 +396,13 @@ function crit:updateOutput(input, seq)
     local first_time = true
     for t=1,L do -- iterate over sequence time (ignore t=1, dummy forward for the image)
 
-      -- fetch the index of the next token in the sequence
       local target_index
-      if t > D then -- we are out of bounds of the index sequence: pad with null tokens
+      if t > D then 
         target_index = 0
       else
         target_index = seq[{t,b}] -- t-1 is correct, since at t=2 START token was fed in and we want to predict first word (and 2-1 = 1).
       end
-      -- the first time we see null token as next index, actually want the model to predict the END token
+      
       if target_index == 0 and first_time then
         target_index = Mp1
         first_time = false
